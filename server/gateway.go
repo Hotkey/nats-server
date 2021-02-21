@@ -2340,6 +2340,11 @@ var subPool = &sync.Pool{
 // subject, etc..
 // <Invoked from any client connection's readLoop>
 func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgroups [][]byte) bool {
+	// We had some times when we were sending across a GW with no subject, and the other side would break
+	// due to parser error. These need to be fixed upstream but also double check here.
+	if len(subject) == 0 {
+		return false
+	}
 	gwsa := [16]*client{}
 	gws := gwsa[:0]
 	// This is in fast path, so avoid calling functions when possible.

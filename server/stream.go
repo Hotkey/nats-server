@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,9 @@ type StreamConfig struct {
 	Template     string          `json:"template_owner,omitempty"`
 	Duplicates   time.Duration   `json:"duplicate_window,omitempty"`
 	Placement    *Placement      `json:"placement,omitempty"`
+	Mirror       string          `json:"mirror,omitempty"`
+	Sources      []string        `json:"sources,omitempty"`
+	Syncs        []string        `json:"syncs,omitempty"`
 }
 
 const JSApiPubAckResponseType = "io.nats.jetstream.api.v1.pub_ack_response"
@@ -72,10 +76,12 @@ type PubAck struct {
 
 // StreamInfo shows config and current state for this stream.
 type StreamInfo struct {
-	Config  StreamConfig `json:"config"`
-	Created time.Time    `json:"created"`
-	State   StreamState  `json:"state"`
-	Cluster *ClusterInfo `json:"cluster,omitempty"`
+	Config  StreamConfig        `json:"config"`
+	Created time.Time           `json:"created"`
+	State   StreamState         `json:"state"`
+	Cluster *ClusterInfo        `json:"cluster,omitempty"`
+	Mirror  *StreamSourceInfo   `json:"mirror,omitempty"`
+	Sources []*StreamSourceInfo `json:"sources,omitempty"`
 }
 
 // ClusterInfo shows information about the underlying set of servers
@@ -96,11 +102,20 @@ type PeerInfo struct {
 	Lag     uint64        `json:"lag,omitempty"`
 }
 
+// StreamSourceInfo shows information about an upstream stream source.
+type StreamSourceInfo struct {
+	Name   string        `json:"name"`
+	Lag    uint64        `json:"lag"`
+	Active time.Duration `json:"active"`
+	Error  *ApiError     `json:"error,omitempty"`
+}
+
 // Stream is a jetstream stream of messages. When we receive a message internally destined
-// for a Stream we will direct link from the client to this Stream structure.
+// for a Stream we will direct link from the client to this structure.
 type stream struct {
 	mu        sync.RWMutex
 	jsa       *jsAccount
+	acc       *Account
 	srv       *Server
 	client    *client
 	sysc      *client
@@ -121,6 +136,13 @@ type stream struct {
 	qch       chan struct{}
 	active    bool
 
+	// Mirror
+	mirror *sourceInfo
+
+	// Sources
+	sources map[string]*sourceInfo
+
+	// TODO(dlc) - Hide everything below behind two pointers.
 	// Clustered mode.
 	sa      *streamAssignment
 	node    RaftNode
@@ -130,6 +152,16 @@ type stream struct {
 	clseq   uint64
 	clfs    uint64
 	lqsent  time.Time
+}
+
+type sourceInfo struct {
+	name string
+	sub  *subscription
+	seq  uint64
+	lag  uint64
+	pack uint64
+	err  *ApiError
+	last time.Time
 }
 
 // Headers for published messages.
@@ -209,6 +241,22 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 		}
 	}
 
+	// Check for mirror designation.
+	if cfg.Mirror != _EMPTY_ {
+		// Can't have subjects.
+		if len(cfg.Subjects) > 0 {
+			jsa.mu.Unlock()
+			return nil, fmt.Errorf("stream mirrors can not also contain subjects")
+		}
+		if len(cfg.Sources) > 0 {
+			jsa.mu.Unlock()
+			return nil, fmt.Errorf("stream mirrors can not also contain other sources")
+		}
+	} else if len(cfg.Subjects) == 0 && len(cfg.Sources) == 0 {
+		jsa.mu.Unlock()
+		return nil, fmt.Errorf("stream needs at least one configured subject or mirror")
+	}
+
 	// Check for overlapping subjects. These are not allowed for now.
 	if jsa.subjectsOverlap(cfg.Subjects) {
 		jsa.mu.Unlock()
@@ -219,7 +267,7 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 	c := s.createInternalJetStreamClient()
 	ic := s.createInternalJetStreamClient()
 
-	mset := &stream{jsa: jsa, cfg: cfg, srv: s, client: c, sysc: ic, consumers: make(map[string]*consumer), qch: make(chan struct{})}
+	mset := &stream{acc: a, jsa: jsa, cfg: cfg, srv: s, client: c, sysc: ic, consumers: make(map[string]*consumer), qch: make(chan struct{})}
 
 	jsa.streams[cfg.Name] = mset
 	storeDir := path.Join(jsa.storeDir, streamsDir, cfg.Name)
@@ -641,7 +689,9 @@ func checkStreamCfg(config *StreamConfig) (StreamConfig, error) {
 	}
 
 	if len(cfg.Subjects) == 0 {
-		cfg.Subjects = append(cfg.Subjects, cfg.Name)
+		if cfg.Mirror == _EMPTY_ && len(cfg.Sources) == 0 {
+			cfg.Subjects = append(cfg.Subjects, cfg.Name)
+		}
 	} else {
 		// We can allow overlaps, but don't allow direct duplicates.
 		dset := make(map[string]struct{}, len(cfg.Subjects))
@@ -831,6 +881,328 @@ func (mset *stream) eraseMsg(seq uint64) (bool, error) {
 	return mset.store.EraseMsg(seq)
 }
 
+// Are we a mirror?
+func (mset *stream) isMirror() bool {
+	mset.mu.RLock()
+	defer mset.mu.RUnlock()
+	return mset.cfg.Mirror != _EMPTY_
+}
+
+func (mset *stream) hasSources() bool {
+	mset.mu.RLock()
+	defer mset.mu.RUnlock()
+	return len(mset.sources) > 0
+}
+
+func (mset *stream) sourcesInfo() (sis []*StreamSourceInfo) {
+	mset.mu.RLock()
+	defer mset.mu.RUnlock()
+	for _, si := range mset.sources {
+		sis = append(sis, mset.sourceInfo(si))
+	}
+	return sis
+}
+
+// Lock should be held
+func (mset *stream) sourceInfo(si *sourceInfo) *StreamSourceInfo {
+	if si == nil {
+		return nil
+	}
+	return &StreamSourceInfo{Name: si.name, Lag: si.lag, Active: time.Since(si.last), Error: si.err}
+}
+
+// Return our source info for our mirror.
+func (mset *stream) mirrorInfo() *StreamSourceInfo {
+	mset.mu.RLock()
+	defer mset.mu.RUnlock()
+	return mset.sourceInfo(mset.mirror)
+}
+
+// processClusteredMirrorMsg will propose the inbound mirrored message to the underlying raft group.
+func (mset *stream) processClusteredMirrorMsg(subject string, hdr, msg []byte, seq uint64, ts int64) error {
+	mset.mu.Lock()
+	defer mset.mu.Unlock()
+	// Do proposal.
+	return mset.node.Propose(encodeStreamMsg(subject, _EMPTY_, hdr, msg, seq, ts))
+}
+
+// processInboundMirrorMsg handles processing messages bound for a stream.
+func (mset *stream) processInboundMirrorMsg(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+	hdr, msg := c.msgParts(rmsg)
+	sseq, _, _, ts, pending := replyInfo(reply)
+
+	mset.mu.Lock()
+
+	// Ignore anything not current.
+	if mset.mirror == nil || sub != mset.mirror.sub {
+		mset.mu.Unlock()
+		return
+	}
+
+	// Mirror info tracking.
+	mset.mirror.lag = pending
+	mset.mirror.pack++
+	mset.mirror.last = time.Now()
+
+	if mset.mirror.pack >= mirrorMaxAckPending && reply != _EMPTY_ {
+		// Ack if needed to keep messages flowing.
+		mset.sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, nil, nil, 0}
+		mset.mirror.pack = 0
+	}
+	isClustered := mset.node != nil
+	mset.mu.Unlock()
+
+	s := mset.srv
+	var err error
+	if isClustered {
+		err = mset.processClusteredMirrorMsg(subject, hdr, msg, sseq-1, ts)
+	} else {
+		err = mset.processJetStreamMsg(subject, reply, hdr, msg, sseq-1, ts)
+	}
+	if err != nil {
+		if err == errLastSeqMismatch {
+			// We may have missed messages, restart.
+			mset.resetMirrorConsumer()
+		} else {
+			s.Debugf("Got error processing JetStream mirror msg: %v", err)
+		}
+		if strings.Contains(err.Error(), "no space left") {
+			s.Errorf("JetStream out of space, will be DISABLED")
+			s.DisableJetStream()
+		}
+	}
+}
+
+func (mset *stream) setMirrorErr(err *ApiError) {
+	mset.mu.Lock()
+	mset.mirror.err = err
+	mset.mu.Unlock()
+}
+
+func (mset *stream) processMirrorConsumerResponse(_ *subscription, c *client, subject, reply string, rmsg []byte) {
+	_, msg := c.msgParts(rmsg)
+
+	var ccr JSApiConsumerCreateResponse
+	if err := json.Unmarshal(msg, &ccr); err != nil {
+		c.Warnf("JetStream bad mirror consumer create response: %q", msg)
+		mset.cancelMirrorConsumer()
+		mset.setMirrorErr(jsInvalidJSONErr)
+		return
+	}
+	if ccr.Error != nil {
+		mset.cancelMirrorConsumer()
+	}
+	mset.setMirrorErr(ccr.Error)
+}
+
+const mirrorMaxAckPending = 256
+
+func (mset *stream) cancelMirrorConsumer() {
+	mset.mu.Lock()
+	defer mset.mu.Unlock()
+	if mset.mirror != nil && mset.mirror.sub != nil {
+		mset.unsubscribe(mset.mirror.sub)
+		mset.mirror.sub = nil
+	}
+}
+
+func (mset *stream) resetMirrorConsumer() error {
+	mset.mu.Lock()
+	defer mset.mu.Unlock()
+	return mset.setupMirrorConsumer()
+}
+
+func (mset *stream) mirrorDurable() string {
+	return string(getHash(fmt.Sprintf("MIRROR:%s:%s", mset.cfg.Mirror, mset.cfg.Name)))
+}
+
+// Setup our mirror consumer.
+// Lock should be held.
+func (mset *stream) setupMirrorConsumer() error {
+	if mset.sendq == nil {
+		return errors.New("sendq required")
+	}
+
+	// Reset
+	if mset.mirror != nil && mset.mirror.sub != nil {
+		mset.unsubscribe(mset.mirror.sub)
+		mset.mirror.sub = nil
+	}
+	sub, err := mset.subscribeInternal(syncSubject("$JS.M"), mset.processInboundMirrorMsg)
+	if err != nil {
+		return err
+	}
+	mset.mirror = &sourceInfo{name: mset.cfg.Mirror, sub: sub}
+
+	// Now send off request to create/update our consumer. This will be all API based even in single server mode.
+	// We calculate durable names apriori so we do not need to save them off.
+
+	state := mset.store.State()
+	durable := mset.mirrorDurable()
+
+	// Make sure to delete any prior durable consumers.
+	subject := fmt.Sprintf(JSApiConsumerDeleteT, mset.cfg.Mirror, durable)
+	mset.sendq <- &jsPubMsg{subject, _EMPTY_, _EMPTY_, nil, nil, nil, 0}
+
+	req := CreateConsumerRequest{
+		Stream: mset.cfg.Mirror,
+		Config: ConsumerConfig{
+			Durable:        durable,
+			DeliverSubject: string(sub.subject),
+			DeliverPolicy:  DeliverByStartSequence,
+			OptStartSeq:    state.LastSeq,
+			AckPolicy:      AckAll,
+			MaxDeliver:     1,
+			MaxAckPending:  mirrorMaxAckPending,
+		},
+	}
+	// If starting out and lastSeq is 0.
+	if state.LastSeq == 0 {
+		req.Config.DeliverPolicy = DeliverAll
+	}
+
+	b, err := json.Marshal(req)
+	if err != nil {
+		mset.unsubscribe(sub)
+		mset.mirror = nil
+		return err
+	}
+
+	reply := infoReplySubject()
+	mset.subscribeInternal(reply, mset.processMirrorConsumerResponse)
+
+	subject = fmt.Sprintf(JSApiDurableCreateT, mset.cfg.Mirror, durable)
+	mset.sendq <- &jsPubMsg{subject, _EMPTY_, reply, nil, b, nil, 0}
+
+	return nil
+}
+
+func (mset *stream) sourceDurable(streamName string) string {
+	return string(getHash(fmt.Sprintf("SOURCE:%s:%s", streamName, mset.cfg.Name)))
+}
+
+// processInboundSourceMsg handles processing other stream messages bound for this stream.
+func (mset *stream) processInboundSourceMsg(si *sourceInfo, sub *subscription, c *client, subject, reply string, rmsg []byte) {
+	sseq, dseq, _, _, pending := replyInfo(reply)
+
+	// FIXME(dlc) - REMOVE!!
+	if strings.HasPrefix(subject, "$JS") {
+		fmt.Printf("c.pa is %q\n", c.pa.arg)
+	}
+
+	// Tracking is done here.
+	mset.mu.Lock()
+	if si != nil {
+		if dseq == 1 {
+			si.seq = sseq
+		} else if sseq == si.seq+1 {
+			si.seq++
+		} else {
+			fmt.Printf("MISSED SEQ! Have %d, got %d, dseq is %d\n\n", si.seq, sseq, dseq)
+			panic("MISSED!")
+			/*
+				// Delete existing.
+				subject := fmt.Sprintf(JSApiConsumerDeleteT, sname, durable)
+				mset.sendq <- &jsPubMsg{subject, _EMPTY_, _EMPTY_, nil, nil, nil, 0}
+			*/
+		}
+
+		si.lag = pending
+		si.pack++
+		si.last = time.Now()
+
+		if si.pack >= mirrorMaxAckPending && reply != _EMPTY_ {
+			// Ack if needed to keep messages flowing.
+			mset.sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, nil, nil, 0}
+			si.pack = 0
+		}
+	}
+	mset.mu.Unlock()
+
+	mset.processInboundJetStreamMsg(sub, c, subject, _EMPTY_, rmsg)
+	// Ack
+	if reply != _EMPTY_ {
+		mset.sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, nil, nil, 0}
+	}
+}
+
+// Setup our source consumers.
+// Lock should be held.
+func (mset *stream) setupSourceConsumers() error {
+	if mset.sendq == nil {
+		return errors.New("sendq required")
+	}
+	// Reset if needed.
+	for _, sinfo := range mset.sources {
+		if sinfo.sub != nil {
+			mset.unsubscribe(sinfo.sub)
+		}
+	}
+	mset.sources = make(map[string]*sourceInfo)
+
+	for _, ss := range mset.cfg.Sources {
+		si := &sourceInfo{name: ss}
+		mset.sources[ss] = si
+
+		// Turn on our subscription here.
+		dsubj := syncSubject("$JS.S")
+		sub, err := mset.subscribeInternal(dsubj, func(sub *subscription, c *client, subject, reply string, rmsg []byte) {
+			mset.processInboundSourceMsg(si, sub, c, subject, reply, rmsg)
+		})
+		if err != nil {
+			si.err = jsError(err)
+			continue
+		}
+		si.sub = sub
+
+		durable := mset.sourceDurable(ss)
+		req := CreateConsumerRequest{
+			Stream: ss,
+			Config: ConsumerConfig{
+				Durable:        durable,
+				DeliverSubject: dsubj,
+				AckPolicy:      AckAll,
+				AckWait:        time.Second,
+				MaxDeliver:     1,
+				MaxAckPending:  mirrorMaxAckPending,
+			},
+		}
+		b, err := json.Marshal(req)
+		if err != nil {
+			return err
+		}
+
+		reply, sname := infoReplySubject(), ss
+		mset.subscribeInternal(reply, func(_ *subscription, c *client, subject, reply string, rmsg []byte) {
+			_, msg := c.msgParts(rmsg)
+			var ccr JSApiConsumerCreateResponse
+			if err := json.Unmarshal(msg, &ccr); err != nil {
+				c.Warnf("JetStream bad source consumer create response: %q", msg)
+				return
+			}
+			mset.mu.Lock()
+			defer mset.mu.Unlock()
+			//fmt.Printf("RECEIVED RESPONSE: %+v\n", ccr.ConsumerInfo)
+			if si := mset.sources[sname]; si != nil {
+				if ccr.Error != nil {
+					fmt.Printf("[%s] ERROR: %+v\n", mset.srv, ccr.Error)
+					c.Warnf("JetStream error response for create source consumer: %+v", ccr.Error)
+					si.err = ccr.Error
+					return
+				}
+			}
+		})
+
+		// Send create request.
+		subject := fmt.Sprintf(JSApiDurableCreateT, ss, durable)
+		mset.sendq <- &jsPubMsg{subject, _EMPTY_, reply, nil, b, nil, 0}
+
+		//fmt.Printf("[%s] SENDING REQUEST to %q - %q\n", mset.srv, subject, b)
+	}
+
+	return nil
+}
+
 // Will create internal subscriptions for the stream.
 // Lock should be held.
 func (mset *stream) subscribeToStream() error {
@@ -842,8 +1214,33 @@ func (mset *stream) subscribeToStream() error {
 			return err
 		}
 	}
+	// Check if we need to setup mirroring.
+	if mset.cfg.Mirror != _EMPTY_ {
+		if err := mset.setupMirrorConsumer(); err != nil {
+			return err
+		}
+	} else if len(mset.cfg.Sources) > 0 {
+		if err := mset.setupSourceConsumers(); err != nil {
+			return err
+		}
+	}
+
 	mset.active = true
 	return nil
+}
+
+// Stop our source consumers.
+// Lock should be held.
+func (mset *stream) stopSourceConsumers() {
+	for _, sinfo := range mset.sources {
+		if sinfo.sub != nil {
+			mset.unsubscribe(sinfo.sub)
+		}
+	}
+	for _, ss := range mset.cfg.Sources {
+		subject := fmt.Sprintf(JSApiConsumerDeleteT, ss, mset.sourceDurable(ss))
+		mset.sendq <- &jsPubMsg{subject, _EMPTY_, _EMPTY_, nil, nil, nil, 0}
+	}
 }
 
 // Will unsubscribe from the stream.
@@ -852,6 +1249,20 @@ func (mset *stream) unsubscribeToStream() error {
 	for _, subject := range mset.cfg.Subjects {
 		mset.unsubscribeInternal(subject)
 	}
+	if mset.mirror != nil {
+		if mset.mirror.sub != nil {
+			mset.unsubscribe(mset.mirror.sub)
+		}
+		durable := mset.mirrorDurable()
+		subject := fmt.Sprintf(JSApiConsumerDeleteT, mset.cfg.Mirror, durable)
+		mset.sendq <- &jsPubMsg{subject, _EMPTY_, _EMPTY_, nil, nil, nil, 0}
+		mset.mirror = nil
+	}
+
+	if len(mset.cfg.Sources) > 0 {
+		mset.stopSourceConsumers()
+	}
+
 	mset.active = false
 	return nil
 }
@@ -1099,8 +1510,8 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 	}
 
 	var accName string
-	if c != nil && c.acc != nil {
-		accName = c.acc.Name
+	if mset.acc != nil {
+		accName = mset.acc.Name
 	}
 
 	doAck := !mset.cfg.NoAck
@@ -1118,17 +1529,27 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 	var resp = &JSPubAckResponse{}
 
 	// For clustering the lower layers will pass our expected lseq. If it is present check for that here.
-	// This is from the clustering layers so will not respond here.
 	if lseq > 0 && lseq != (mset.lseq+mset.clfs) {
-		sendq := mset.sendq
-		mset.mu.Unlock()
-		if canRespond && sendq != nil {
-			resp.PubAck = &PubAck{Stream: name}
-			resp.Error = &ApiError{Code: 503, Description: "expected stream sequence does not match"}
-			b, _ := json.Marshal(resp)
-			sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, b, nil, 0}
+		isMisMatch := true
+		// If our first message for this mirror, see if we have to adjust our starting sequence.
+		if mset.cfg.Mirror != _EMPTY_ {
+			if state := mset.store.State(); state.FirstSeq == 0 {
+				mset.store.Compact(lseq + 1)
+				mset.lseq = lseq
+				isMisMatch = false
+			}
 		}
-		return errLastSeqMismatch
+		if isMisMatch {
+			sendq := mset.sendq
+			mset.mu.Unlock()
+			if canRespond && sendq != nil {
+				resp.PubAck = &PubAck{Stream: name}
+				resp.Error = &ApiError{Code: 503, Description: "expected stream sequence does not match"}
+				b, _ := json.Marshal(resp)
+				sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, b, nil, 0}
+			}
+			return errLastSeqMismatch
+		}
 	}
 
 	// Process msg headers if present.
@@ -1382,12 +1803,10 @@ func (mset *stream) name() string {
 
 func (mset *stream) internalSendLoop() {
 	mset.mu.RLock()
-	c := mset.client
-	if c == nil {
-		mset.mu.RUnlock()
-		return
-	}
-	s := c.srv
+	s := mset.srv
+	c := s.createInternalJetStreamClient()
+	c.registerWithAccount(mset.acc)
+	defer c.closeConnection(ClientClosed)
 	sendq := mset.sendq
 	name := mset.cfg.Name
 	mset.mu.RUnlock()

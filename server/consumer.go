@@ -2063,6 +2063,10 @@ func (o *consumer) deliverCurrentMsg(subj string, hdr, msg []byte, seq uint64, t
 // Deliver a msg to the consumer.
 // Lock should be held and o.mset validated to be non-nil.
 func (o *consumer) deliverMsg(dsubj, subj string, hdr, msg []byte, seq, dc uint64, ts int64) {
+	if strings.HasPrefix(subj, "$JS") {
+		fmt.Printf("deliverMsg called with dsubj %q, subj %q\n\n", dsubj, subj)
+	}
+
 	if o.mset == nil || o.sendq == nil {
 		return
 	}
@@ -2254,7 +2258,7 @@ func parseAckReplyNum(d string) (n int64) {
 const expectedNumReplyTokens = 9
 
 // Grab encoded information in the reply subject for a delivered message.
-func (o *consumer) replyInfo(subject string) (sseq, dseq, dc uint64, ts int64, pending uint64) {
+func replyInfo(subject string) (sseq, dseq, dc uint64, ts int64, pending uint64) {
 	tsa := [expectedNumReplyTokens]string{}
 	start, tokens := 0, tsa[:0]
 	for i := 0; i < len(subject); i++ {
